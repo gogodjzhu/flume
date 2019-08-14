@@ -60,6 +60,8 @@ Configurable, EventDrivenSource {
   private String inputCharset;
 
   private SourceCounter sourceCounter;
+  // 实际读取文件生成Event的工作落在此对象上, 实现了ReliableEventReader接口, 支持
+  // commit操作
   ReliableSpoolingFileEventReader reader;
 
   @Override
@@ -72,6 +74,7 @@ Configurable, EventDrivenSource {
 
     File directory = new File(spoolDirectory);
     try {
+      // 实例化真正读数据的Reader
       reader = new ReliableSpoolingFileEventReader.Builder()
           .spoolDirectory(directory)
           .completedSuffix(completedSuffix)
@@ -91,6 +94,7 @@ Configurable, EventDrivenSource {
 
     Runnable runner = new SpoolDirectoryRunnable(reader, sourceCounter);
     executor.scheduleWithFixedDelay(
+        // 定时扫描SpoolDirectory
         runner, 0, POLL_DELAY_MS, TimeUnit.MILLISECONDS);
 
     super.start();
@@ -157,14 +161,19 @@ Configurable, EventDrivenSource {
     public void run() {
       try {
         while (true) {
+          // 调用reader拉取最多batchSize条数据, 内部会处理文件切换, 读取记录恢复等工作
           List<Event> events = reader.readEvents(batchSize);
+          // 没有新Event, 退出此次循环
           if (events.isEmpty()) {
             break;
           }
           sourceCounter.addToEventReceivedCount(events.size());
           sourceCounter.incrementAppendBatchReceivedCount();
 
+          // 通过channelProcessor写入Event到目标Channel, 任何目标Channel的失败会抛出
+          // Exception
           getChannelProcessor().processEventBatch(events);
+          // commit, 会将最新的位置保存到tracker文件中持久化
           reader.commit();
           sourceCounter.addToEventAcceptedCount(events.size());
           sourceCounter.incrementAppendBatchAcceptedCount();

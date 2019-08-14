@@ -60,8 +60,14 @@ public class DurablePositionTracker implements PositionTracker {
    * We go through this to avoid issues with partial reads at the end of the
    * file from a previous crash. If we append to a bad record,
    * our writes may never be visible.
-   * @param trackerFile
-   * @param target
+   * 由于trackerFile本身可能因为进程退出写不完整, 所以发现有旧的trackerFile时, 需要从头
+   * 读取它, 并重新生成一个trackerFile保证数据完整性.
+   * 如果启动时trackerFile不存在, 就简单新建即可
+   *
+   * trackerFile以avro格式保存数据
+   *
+   * @param trackerFile 旧trackerFile
+   * @param target 新的tracerFile的路径
    * @return
    * @throws IOException
    */
@@ -72,18 +78,23 @@ public class DurablePositionTracker implements PositionTracker {
       return new DurablePositionTracker(trackerFile, target);
     }
 
-    // exists
+    // 存在旧的tracker, 将其读入内存
     DurablePositionTracker oldTracker =
         new DurablePositionTracker(trackerFile, target);
+    // target为旧tracker对应的物理文件路径
     String existingTarget = oldTracker.getTarget();
+    // 就tracker记录的最新读取位置
     long targetPosition = oldTracker.getPosition();
+    // 关闭旧tracker, 回收相关资源
     oldTracker.close();
 
+    // 创建.tmp临时文件
     File tmpMeta = File.createTempFile(trackerFile.getName(), ".tmp",
         trackerFile.getParentFile());
     tmpMeta.delete();
     DurablePositionTracker tmpTracker =
         new DurablePositionTracker(tmpMeta, existingTarget);
+    // 将最新的读取位置写入临时文件
     tmpTracker.storePosition(targetPosition);
     tmpTracker.close();
 
@@ -98,13 +109,13 @@ public class DurablePositionTracker implements PositionTracker {
       }
     }
 
-    // rename tmp file to meta
+    // 将临时文件重命名为新的trackerFile
     if (!tmpMeta.renameTo(trackerFile)) {
       throw new IOException("Unable to rename " + tmpMeta + " to " +
           trackerFile);
     }
 
-    // return a new known-good version that is open for append
+    // 最后返回一个整理好的trackerFile对象
     DurablePositionTracker newTracker =
         new DurablePositionTracker(trackerFile, existingTarget);
     return newTracker;

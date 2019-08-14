@@ -199,25 +199,32 @@ public class ReliableSpoolingFileEventReader implements ReliableEventReader {
   }
 
   public List<Event> readEvents(int numEvents) throws IOException {
+    // 有未commit的操作需要回滚, 重新读取文件生成Event
     if (!committed) {
       if (!currentFile.isPresent()) {
         throw new IllegalStateException("File should not roll when " +
             "commit is outstanding.");
       }
       logger.info("Last read was never committed - resetting mark position.");
+      /** 通过{@linkplain LineDeserializer#reset()}回滚, 底层通过nio处理*/
       currentFile.get().getDeserializer().reset();
     } else {
       // Check if new files have arrived since last call
       if (!currentFile.isPresent()) {
+        // 读取spoolDirectory目录获取下一个要处理的文件
         currentFile = getNextFile();
       }
       // Return empty list if no new files
+      // 没有符合条件的新文件, 返回空列表
       if (!currentFile.isPresent()) {
         return Collections.emptyList();
       }
     }
 
+    // EventDeserializer实际处理读取文件生成Event的工作
     EventDeserializer des = currentFile.get().getDeserializer();
+    /** 通过{@linkplain LineDeserializer#readEvents(int)}} 消费文件生成Event, 就是
+     * 把一行数据保存到body而已 */
     List<Event> events = des.readEvents(numEvents);
 
     /* It's possible that the last read took us just up to a file boundary.
@@ -231,6 +238,7 @@ public class ReliableSpoolingFileEventReader implements ReliableEventReader {
       events = currentFile.get().getDeserializer().readEvents(numEvents);
     }
 
+    // 如果开启了fileHeader配置, 需要将文件名写入到Header中
     if (annotateFileName) {
       String filename = currentFile.get().getFile().getAbsolutePath();
       for (Event event : events) {
@@ -383,6 +391,10 @@ public class ReliableSpoolingFileEventReader implements ReliableEventReader {
   private Optional<FileInfo> getNextFile() {
     /* Filter to exclude finished or hidden files */
     FileFilter filter = new FileFilter() {
+      /**
+       * 文件选择, 目录/completedSuffix结尾的文件/隐藏文件('.'开头)/符合ignorePattern
+       * 正则表达式的文件排除
+       */
       public boolean accept(File candidate) {
         String fileName = candidate.getName();
         if ((candidate.isDirectory()) ||
@@ -398,6 +410,7 @@ public class ReliableSpoolingFileEventReader implements ReliableEventReader {
     if (candidateFiles.isEmpty()) {
       return Optional.absent();
     } else {
+      // 以modified时间排序, 最旧修改的文件排前. modified时间相同, 以文件名排序
       Collections.sort(candidateFiles, new Comparator<File>() {
         public int compare(File a, File b) {
           int timeComparison = new Long(a.lastModified()).compareTo(
@@ -410,9 +423,10 @@ public class ReliableSpoolingFileEventReader implements ReliableEventReader {
           }
         }
       });
+      // 获取modified最早的文件
       File nextFile = candidateFiles.get(0);
       try {
-        // roll the meta file, if needed
+        // 回溯已有trackerFile(如果存在的话), 生成新的tracker对象
         String nextPath = nextFile.getPath();
         PositionTracker tracker =
             DurablePositionTracker.getInstance(metaFile, nextPath);
@@ -427,12 +441,18 @@ public class ReliableSpoolingFileEventReader implements ReliableEventReader {
             "Tracker target %s does not equal expected filename %s",
             tracker.getTarget(), nextPath);
 
+        // ResettableInputStream封装了基于FileChannel的文件流读取方法, 支持reset(通
+        // 过tracker保存的position)
         ResettableInputStream in =
             new ResettableFileInputStream(nextFile, tracker,
                 ResettableFileInputStream.DEFAULT_BUF_SIZE, inputCharset);
+
+        /** deserializerType指定InputStream到Event的解析类型(spoolDirectorySource
+         默认为LINE, 即按行解析 {@linkplain LineDeserializer})*/
         EventDeserializer deserializer = EventDeserializerFactory.getInstance
             (deserializerType, deserializerContext, in);
 
+        // 返回FileInfo
         return Optional.of(new FileInfo(nextFile, deserializer));
       } catch (FileNotFoundException e) {
         // File could have been deleted in the interim

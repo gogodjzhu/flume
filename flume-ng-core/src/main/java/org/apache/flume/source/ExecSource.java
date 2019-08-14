@@ -287,11 +287,15 @@ Configurable {
         String line = null;
         final List<Event> eventList = new ArrayList<Event>();
 
+        // 独立线程池, 负责定时清空event缓存
         timedFlushService = Executors.newSingleThreadScheduledExecutor(
                 new ThreadFactoryBuilder().setNameFormat(
                 "timedFlushExecService" +
                 Thread.currentThread().getId() + "-%d").build());
         try {
+          // 封装process通过子进程执行
+          // NOTE 通过kill -9 杀死进程时, 会导致process进程未关闭,
+          // 可以通过添加钩子方法来显式3关闭
           if(shell != null) {
             String[] commandArgs = formulateShellCommand(shell, command);
             process = Runtime.getRuntime().exec(commandArgs);
@@ -314,6 +318,7 @@ Configurable {
               public void run() {
                 try {
                   synchronized (eventList) {
+                    // 缓存不为空才做flush
                     if(!eventList.isEmpty() && timeout()) {
                       flushEventBatch(eventList);
                     }
@@ -326,12 +331,15 @@ Configurable {
                 }
               }
           },
+          // 通过batchTimeout来控制定时flush频率
           batchTimeout, batchTimeout, TimeUnit.MILLISECONDS);
 
+          // 正式开始读输入流, 流关闭的时候退出while循环
           while ((line = reader.readLine()) != null) {
             synchronized (eventList) {
               sourceCounter.incrementEventReceivedCount();
               eventList.add(EventBuilder.withBody(line.getBytes(charset)));
+              // 达到数量阈值也将触发flush
               if(eventList.size() >= bufferCount || timeout()) {
                 flushEventBatch(eventList);
               }
@@ -346,6 +354,8 @@ Configurable {
         } catch (Exception e) {
           logger.error("Failed while running command: " + command, e);
           if(e instanceof InterruptedException) {
+            // 中断异常, 在打完值之后还需要继续中断自己, 保证中断逻辑完整
+            // (否则restart=true时将导致线程无法停止)
             Thread.currentThread().interrupt();
           }
         } finally {
@@ -358,6 +368,10 @@ Configurable {
           }
           exitCode = String.valueOf(kill());
         }
+
+        // 退出流程
+
+        // 如果配置了restart为true, command退出后会尝试重启整个流程执行command
         if(restart) {
           logger.info("Restarting in {}ms, exit code {}", restartThrottle,
               exitCode);
@@ -373,9 +387,13 @@ Configurable {
     }
 
     private void flushEventBatch(List<Event> eventList){
+      // 通过channelProcessor写入Event到目标Channel, 任何目标Channel的失败会抛出
+      // Exception
       channelProcessor.processEventBatch(eventList);
+      // 统计
       sourceCounter.addToEventAcceptedCount(eventList.size());
       eventList.clear();
+      // 记录输入channel操作时间
       lastPushToChannel = systemClock.currentTimeMillis();
     }
 
