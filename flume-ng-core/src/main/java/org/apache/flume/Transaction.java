@@ -48,6 +48,9 @@ import org.apache.flume.channel.BasicTransactionSemantics;
  * access to Transactions, see {@link BasicChannelSemantics} and
  * {@link  BasicTransactionSemantics}.
  *
+ * 事务接口, 接口只定义了事务操作的几个核心方法begin, commit, rollback, close, 但不对
+ * 子类的事务实现做任何要求. 不同的实现对事务的语义保证可能完全不同
+ *
  * @see org.apache.flume.Channel
  */
 public interface Transaction {

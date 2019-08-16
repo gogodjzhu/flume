@@ -57,6 +57,10 @@ import com.google.common.base.Preconditions;
  * InterruptedException, though it still first restores the
  * interrupted status of the thread.
  * </p>
+ *
+ * 此抽象类提供了事务操作会用到的一些公共方法, 包括:
+ *  - 事务状态的维护, 保证每个操作都在合法的状态下执行(比如往状态不为OPEN的事务中写入数
+ *    据会抛出异常)
  */
 public abstract class BasicTransactionSemantics implements Transaction {
 

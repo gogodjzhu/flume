@@ -46,6 +46,15 @@ import com.google.common.base.Preconditions;
  * Additionally, MemoryChannel should be used when a channel is required for
  * unit testing purposes.
  * </p>
+ *
+ * 基于内存实现的Channel, 非常常用的一个Channel,
+ * 它的优点:
+ *  - 基于内存缓存Event, 速度快
+ *  - 支持事务
+ *  - 支持配置缓存大小
+ *  - 支持配置事务大小
+ * 缺点:
+ *  - 崩溃导致数据丢失
  */
 @InterfaceAudience.Public
 @InterfaceStability.Stable
@@ -60,6 +69,10 @@ public class MemoryChannel extends BasicChannelSemantics {
 
   private static final Integer defaultKeepAlive = 3;
 
+  /**
+   * MemoryChannel提供的事务实现, 在内存中实现事务操作. 同一个事务内可以同时执行读/写
+   * 操作
+   */
   private class MemoryTransaction extends BasicTransactionSemantics {
     private LinkedBlockingDeque<Event> takeList;
     private LinkedBlockingDeque<Event> putList;
@@ -77,9 +90,15 @@ public class MemoryChannel extends BasicChannelSemantics {
     @Override
     protected void doPut(Event event) throws InterruptedException {
       channelCounter.incrementEventPutAttemptCount();
+      // byteCapacitySlotSize: 平均多少个字节占用一个Semaphore信号量
+      // eventByteSize = eventSize(仅body) / byteCapacitySlotSize, event需要占用
+      // 的信号量数量
       int eventByteSize = (int)Math.ceil(estimateEventSize(event)/byteCapacitySlotSize);
 
+
+      // 使用event体积预估信号量(semaphore总的信号量即总的可用空间), 剩余不足时尝试等待
       if (bytesRemaining.tryAcquire(eventByteSize, keepAlive, TimeUnit.SECONDS)) {
+        // putList用于保存写入到当前事务的未提交event(亦即source提交到channel的event)
         if(!putList.offer(event)) {
           throw new ChannelException("Put queue for MemoryTransaction of capacity " +
               putList.size() + " full, consider committing more frequently, " +
@@ -92,36 +111,57 @@ public class MemoryChannel extends BasicChannelSemantics {
              (bytesRemaining.availablePermits() * (int)byteCapacitySlotSize) + " bytes are already used." +
             " Try consider comitting more frequently, increasing byteCapacity or increasing thread count");
       }
+      // takeByteCounter通过信号量来监控put情况
       putByteCounter += eventByteSize;
     }
 
     @Override
     protected Event doTake() throws InterruptedException {
       channelCounter.incrementEventTakeAttemptCount();
+
+      // takeList用于保存从当前事务拉取的未commit的event(亦即sink从channel拉取的数据)
       if(takeList.remainingCapacity() == 0) {
+        // takeList保存一个事务中未提交的数据, 它的容量填满时, 抛出异常. 应该适当提高
+        // 事务提交的速度
         throw new ChannelException("Take list for MemoryTransaction, capacity " +
             takeList.size() + " full, consider committing more frequently, " +
             "increasing capacity, or increasing thread count");
       }
+      // 通过queueStored : Semaphore 信号量来保存已经提交且可供拉取的event数量
       if(!queueStored.tryAcquire(keepAlive, TimeUnit.SECONDS)) {
         return null;
       }
       Event event;
+      // 从queue中拉取一个event
       synchronized(queueLock) {
         event = queue.poll();
       }
       Preconditions.checkNotNull(event, "Queue.poll returned NULL despite semaphore " +
           "signalling existence of entry");
+      // 将刚拉取的event放到takeList, 此list中保存的都是未commit的pull event
       takeList.put(event);
 
+      // takeByteCounter通过信号量来监控take情况
       int eventByteSize = (int)Math.ceil(estimateEventSize(event)/byteCapacitySlotSize);
       takeByteCounter += eventByteSize;
 
       return event;
     }
 
+    /**
+     * commit事务, 注意读take/写put提交都通过本方法
+     */
     @Override
     protected void doCommit() throws InterruptedException {
+      // 等效于 queueRemaining 信号量尝试获取(putList.size() - takeList.size())
+      // 目的在于保证queue有足够的空间保存事务commit的event
+      // 注意这里的计算有点讲究: putList为待写入queue的event. takeList为从
+      // queue拉取走, 但尚未commit的event, 此部分给queue腾出空间.
+      // 当takeList - putList < 0时, 表示此次事务拉走的event数量多于新增, 此时commit
+      // queue内空间不增反减, 所以不需要通过tryAcquire控制. 最后还需要release增加queue
+      // 的剩余空间
+      // 当takeList - putList > 0时, 即此次事务新增的event比拉走的多, 需要通过
+      // tryAcquire控制, 消耗queue剩余空间
       int remainingChange = takeList.size() - putList.size();
       if(remainingChange < 0) {
         if(!queueRemaining.tryAcquire(-remainingChange, keepAlive, TimeUnit.SECONDS)) {
@@ -131,6 +171,7 @@ public class MemoryChannel extends BasicChannelSemantics {
       }
       int puts = putList.size();
       int takes = takeList.size();
+      // 将putList中的数据转移到queue
       synchronized(queueLock) {
         if(puts > 0 ) {
           while(!putList.isEmpty()) {
@@ -142,12 +183,16 @@ public class MemoryChannel extends BasicChannelSemantics {
         putList.clear();
         takeList.clear();
       }
+      // take commit释放queue空间, release表示增加剩余的可容纳字节, putByteCounter不
+      // 做类似操作因为put commit只是将event从putList移到queue, 空间占用不变
       bytesRemaining.release(takeByteCounter);
       takeByteCounter = 0;
       putByteCounter = 0;
 
+      // 新增queueStored信号量, 表示queue的容量新增
       queueStored.release(puts);
       if(remainingChange > 0) {
+        // 此次事务新增的空间多于消耗的
         queueRemaining.release(remainingChange);
       }
       if (puts > 0) {
@@ -157,12 +202,14 @@ public class MemoryChannel extends BasicChannelSemantics {
         channelCounter.addToEventTakeSuccessCount(takes);
       }
 
+      // 更新channel内缓存的event数量
       channelCounter.setChannelSize(queue.size());
     }
 
     @Override
     protected void doRollback() {
       int takes = takeList.size();
+      // rollback, putList直接清空, takeList还需放回queue
       synchronized(queueLock) {
         Preconditions.checkState(queue.remainingCapacity() >= takeList.size(), "Not enough space in memory channel " +
             "queue to rollback takes. This should never happen, please report");
@@ -185,9 +232,19 @@ public class MemoryChannel extends BasicChannelSemantics {
   // it should never be held through a blocking operation
   private Object queueLock = new Object();
 
+  // 在实际缓存Event的队列, 注意此双向链表非线程安全, 所以通过上面的 queueLock 加锁操作
   @GuardedBy(value = "queueLock")
   private LinkedBlockingDeque<Event> queue;
 
+  /**
+   * 这里非常巧妙地利用三个Semaphore来控制queue的内存使用,
+   * queueRemaining表示queue剩余的空间, 启动时为初始化capacity
+   * queueStore 表示queue中保存的event数量, 启动时为0, commit和rollback的时候release,
+   * take的时候tryAcquire
+   * bytesRemaining为整个channel剩余可用的字节空间, byteCapacitySlotSize个字节映射一
+   * 个信号量. 由于信号量为int类型, 当可用空间int溢出, 可以通过byteCapacitySlotSize
+   * 调节
+   */
   // invariant that tracks the amount of space remaining in the queue(with all uncommitted takeLists deducted)
   // we maintain the remaining permits = queue.remaining - takeList.size()
   // this allows local threads waiting for space in the queue to commit without denying access to the
