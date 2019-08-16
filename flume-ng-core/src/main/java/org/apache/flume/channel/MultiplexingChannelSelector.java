@@ -30,6 +30,10 @@ import org.apache.flume.FlumeException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+/**
+ * 两个flume内置提供的ChannelSelector之一, 根据mapping+header配置来选择每个Event的去向
+ * 可以实现Channel路由功能
+ */
 public class MultiplexingChannelSelector extends AbstractChannelSelector {
 
   public static final String CONFIG_MULTIPLEX_HEADER_NAME = "header";

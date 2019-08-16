@@ -30,6 +30,12 @@ import org.apache.flume.Event;
 /**
  * Replicating channel selector. This selector allows the event to be placed
  * in all the channels that the source is configured with.
+ *
+ * 两个flume内置的ChannelSelector之一, 所有配置的channel均会接收source的每一个Event
+ *
+ * 但channel分两类:
+ *  - required: 必须保证所有此类channel都提交成功, event才算提交成功
+ *  - optional: 可以失败, 失败不妨碍event提交
  */
 public class ReplicatingChannelSelector extends AbstractChannelSelector {
 
@@ -66,6 +72,7 @@ public class ReplicatingChannelSelector extends AbstractChannelSelector {
     if(optionalList != null && !optionalList.isEmpty()) {
       for(String optional : optionalList.split("\\s+")) {
         Channel optionalChannel = channelNameMap.get(optional);
+        // 注意! require如果跟optional重叠, 以optional为主
         requiredChannels.remove(optionalChannel);
         if (!optionalChannels.contains(optionalChannel)) {
           optionalChannels.add(optionalChannel);

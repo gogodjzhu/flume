@@ -132,10 +132,13 @@ public class ChannelProcessor implements Configurable {
    * Attempts to {@linkplain Channel#put(Event) put} the given events into each
    * configured channel. If any {@code required} channel throws a
    * {@link ChannelException}, that exception will be propagated.
+   * 将Events put到Channel, channel分required和optional两类, 任意required的channel
+   * 失败会抛出异常
    *
    * <p>Note that if multiple channels are configured, some {@link Transaction}s
    * may have already been committed while others may be rolled back in the
    * case of an exception.
+   * 每个channel单独管理事务, 如果一次put多个channels, 异常时可能部分事务成功,部分失败
    *
    * @param events A list of events to put into the configured channels.
    * @throws ChannelException when a write to a required channel fails.
@@ -143,14 +146,18 @@ public class ChannelProcessor implements Configurable {
   public void processEventBatch(List<Event> events) {
     Preconditions.checkNotNull(events, "Event list must not be null");
 
+    // 拦截器工作
     events = interceptorChain.intercept(events);
 
+    // required channels -> event 待发送map, 注意是LinkedHashMap, 有序
     Map<Channel, List<Event>> reqChannelQueue =
         new LinkedHashMap<Channel, List<Event>>();
 
+    // optional channels -> event 待发送map
     Map<Channel, List<Event>> optChannelQueue =
         new LinkedHashMap<Channel, List<Event>>();
 
+    /* 将event放入对应缓存 */
     for (Event event : events) {
       List<Channel> reqChannels = selector.getRequiredChannels(event);
 
@@ -178,6 +185,8 @@ public class ChannelProcessor implements Configurable {
 
     // Process required channels
     for (Channel reqChannel : reqChannelQueue.keySet()) {
+      // 开启事务, 注意这里的事务由channel提供, 不同的实现事务保证不同.
+      // 详情看每个channel实现
       Transaction tx = reqChannel.getTransaction();
       Preconditions.checkNotNull(tx, "Transaction object must not be null");
       try {
@@ -186,12 +195,14 @@ public class ChannelProcessor implements Configurable {
         List<Event> batch = reqChannelQueue.get(reqChannel);
 
         for (Event event : batch) {
+          // 挨个put到channel
           reqChannel.put(event);
         }
 
         tx.commit();
       } catch (Throwable t) {
         tx.rollback();
+        // 任何异常都会往上抛, 停止此次操作
         if (t instanceof Error) {
           LOG.error("Error while writing to required channel: " +
               reqChannel, t);
@@ -222,7 +233,9 @@ public class ChannelProcessor implements Configurable {
 
         tx.commit();
       } catch (Throwable t) {
+        // 事务回滚
         tx.rollback();
+        // 普通的Throwable异常会被吃掉, 致命Error往上抛
         LOG.error("Unable to put batch on optional channel: " + optChannel, t);
         if (t instanceof Error) {
           throw (Error) t;
