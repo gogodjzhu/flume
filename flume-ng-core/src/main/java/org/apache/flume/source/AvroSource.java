@@ -54,12 +54,14 @@ import org.apache.flume.instrumentation.SourceCounter;
 import org.apache.flume.source.avro.AvroFlumeEvent;
 import org.apache.flume.source.avro.AvroSourceProtocol;
 import org.apache.flume.source.avro.Status;
+import org.jboss.netty.channel.ChannelFactory;
 import org.jboss.netty.channel.ChannelPipelineFactory;
 import org.jboss.netty.channel.ChannelPipeline;
 import org.jboss.netty.channel.socket.nio.NioServerSocketChannelFactory;
 import org.jboss.netty.channel.Channels;
 import org.jboss.netty.handler.codec.compression.ZlibDecoder;
 import org.jboss.netty.handler.codec.compression.ZlibEncoder;
+import org.jboss.netty.handler.execution.ExecutionHandler;
 import org.jboss.netty.handler.ssl.SslHandler;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -191,8 +193,15 @@ public class AvroSource extends AbstractSource implements EventDrivenSource,
   public void start() {
     logger.info("Starting {}...", this);
 
+    /** avro解析ChannelBuffer得到消息对象的实际方法在此对象内, 通过NettyServer ->
+    * ChannelHandler回调Responder的response方法实现
+    * Responder解析ChannelBuffer的方法这里不做展开, 解析之后得到AvroFlumeEvent对象,
+    * 回调子类(即this)的{@linkplain this##append(AvroFlumeEvent)} 或appendBatch
+     * 方法
+    */
     Responder responder = new SpecificResponder(AvroSourceProtocol.class, this);
 
+    // SocketChannelFactory & ChannelPipelineFactory for netty
     NioServerSocketChannelFactory socketChannelFactory = initSocketChannelFactory();
 
     ChannelPipelineFactory pipelineFactory = initChannelPipelineFactory();
@@ -201,10 +210,11 @@ public class AvroSource extends AbstractSource implements EventDrivenSource,
           socketChannelFactory, pipelineFactory, null);
 
     connectionCountUpdater = Executors.newSingleThreadScheduledExecutor();
-    server.start();
+    server.start(); // 对于NettyServer, 构造方法中已经通过bind()方法启动, 这里无动作
     sourceCounter.start();
     super.start();
     final NettyServer srv = (NettyServer)server;
+    // connectionCountUpdater负责监控NettyServer的客户端连接数
     connectionCountUpdater.scheduleWithFixedDelay(new Runnable(){
 
       @Override
@@ -217,6 +227,10 @@ public class AvroSource extends AbstractSource implements EventDrivenSource,
     logger.info("Avro source {} started.", getName());
   }
 
+    /**
+     * 创建ServerSocketChannel, 限制最大线程数时, worker线程池被限定, 否则boss/worker
+     * 线程池均为newCachedThreadPool
+     */
   private NioServerSocketChannelFactory initSocketChannelFactory() {
     NioServerSocketChannelFactory socketChannelFactory;
     if (maxThreads <= 0) {
@@ -230,6 +244,13 @@ public class AvroSource extends AbstractSource implements EventDrivenSource,
     return socketChannelFactory;
   }
 
+    /**
+     * 配置了压缩或加密的情况生成特殊的ChannelPipelineFactory, 否则返回一个空的
+     * ChannelPipelineFactory(无handler), 在{@linkplain NettyServer#NettyServer(
+     * Responder, InetSocketAddress, ChannelFactory, ChannelPipelineFactory,
+     * ExecutionHandler)} 中会根据此Factory返回的pipeline做进一步封装得到有业务Handler
+     * 的Factory
+     */
   private ChannelPipelineFactory initChannelPipelineFactory() {
     ChannelPipelineFactory pipelineFactory;
     boolean enableCompression = compressionType.equalsIgnoreCase("deflate");
@@ -252,9 +273,14 @@ public class AvroSource extends AbstractSource implements EventDrivenSource,
   public void stop() {
     logger.info("Avro source {} stopping: {}", getName(), this);
 
+    /**
+     * 底层调用{@linkplain NettyServer#close()}, 通过ChannelGroup关闭Channel(s),
+     * 释放资源. 全部完成后CountDownLatch.countDown()
+     */
     server.close();
 
     try {
+      // 等待NettyServer关闭, CountDownLatch.await()
       server.join();
     } catch (InterruptedException e) {
       logger.info("Avro source " + getName() + ": Interrupted while waiting " +
@@ -295,6 +321,9 @@ public class AvroSource extends AbstractSource implements EventDrivenSource,
     return stringMap;
   }
 
+  /**
+   * NettyServer在收到客户端报文后, 经过解析封装成AvroFlumeEvent对象回调此方法
+   */
   @Override
   public Status append(AvroFlumeEvent avroEvent) {
     logger.debug("Avro source {}: Received avro event: {}", getName(),
@@ -302,6 +331,7 @@ public class AvroSource extends AbstractSource implements EventDrivenSource,
     sourceCounter.incrementAppendReceivedCount();
     sourceCounter.incrementEventReceivedCount();
 
+    // avroEvent封装成FlumeEvent
     Event event = EventBuilder.withBody(avroEvent.getBody().array(),
         toStringMap(avroEvent.getHeaders()));
 
@@ -319,6 +349,7 @@ public class AvroSource extends AbstractSource implements EventDrivenSource,
     return Status.OK;
   }
 
+  // 类似于上面的append, 除了本方法为批量
   @Override
   public Status appendBatch(List<AvroFlumeEvent> events) {
     logger.debug("Avro source {}: Received avro event batch of {} events.",
