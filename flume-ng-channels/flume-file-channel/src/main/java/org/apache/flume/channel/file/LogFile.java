@@ -34,6 +34,7 @@ import org.slf4j.LoggerFactory;
 import javax.annotation.Nullable;
 import java.io.EOFException;
 import java.io.File;
+import java.io.FileInputStream;
 import java.io.FileNotFoundException;
 import java.io.IOException;
 import java.io.RandomAccessFile;
@@ -46,6 +47,9 @@ import java.util.concurrent.atomic.AtomicLong;
 
 @InterfaceAudience.Private
 @InterfaceStability.Unstable
+/**
+ * 日志文件抽象, 代表磁盘中的一个log文件
+ */
 public abstract class LogFile {
 
   private static final Logger LOG = LoggerFactory
@@ -116,6 +120,7 @@ public abstract class LogFile {
         throws IOException {
       markCheckpoint(lastCheckpointOffset, logWriteOrderID);
     }
+    // 每个log文件对应有一个.meta文件保存元数据, 本方法就是将最新的元数据覆写到指定mera文件
     abstract void markCheckpoint(long currentPosition, long logWriteOrderID)
         throws IOException;
 
@@ -148,6 +153,11 @@ public abstract class LogFile {
       Preconditions.checkArgument(numBytes >= 0, "numBytes less than zero");
       value.addAndGet(-numBytes);
     }
+
+    /**
+     * 获取文件剩余可用空间(字节), 在单位时间interval(默认15秒)内多次调用会会用缓存结果
+     * @return
+     */
     long getUsableSpace() {
       long now = System.currentTimeMillis();
       if(now - interval > lastRefresh.get()) {
@@ -262,12 +272,19 @@ public abstract class LogFile {
       lastCommitPosition = position();
     }
 
+    /**
+     * 将ByteBuffer写入文件, 使用的是{@linkplain FileChannel}提供方法
+     * @return 返回Pair<日志文件ID, Buffer开始位置偏移量>
+     */
     private Pair<Integer, Integer> write(ByteBuffer buffer)
       throws IOException {
+      // 文件未打开, 可以重试再来一次
       if(!isOpen()) {
         throw new LogFileRetryableIOException("File closed " + file);
       }
+      // FileChannel当前的position
       long length = position();
+      // 检查文件可用容量是否足够
       long expectedLength = length + (long) buffer.limit();
       if(expectedLength > maxFileSize) {
         throw new LogFileRetryableIOException(expectedLength + " > " +
@@ -275,10 +292,13 @@ public abstract class LogFile {
       }
       int offset = (int)length;
       Preconditions.checkState(offset >= 0, String.valueOf(offset));
-      // OP_RECORD + size + buffer
+      // OP_RECORD(Byte.MAX_VALUE) + size + buffer
       int recordLength = 1 + (int)Serialization.SIZE_OF_INT + buffer.limit();
+      // 减少可用空间
       usableSpace.decrement(recordLength);
+      // 预分配空间
       preallocate(recordLength);
+      // 构造buffer并写入FileChannel
       ByteBuffer toWrite = ByteBuffer.allocate(recordLength);
       toWrite.put(OP_RECORD);
       writeDelimitedBuffer(toWrite, buffer);
@@ -338,6 +358,12 @@ public abstract class LogFile {
         }
       }
     }
+
+    /**
+     * 为了防止每次write操作都做一次空间申请, 空间不足时会预分配1m的存储空间
+     * @param size
+     * @throws IOException
+     */
     protected void preallocate(int size) throws IOException {
       long position = position();
       if(position + size > getFileChannel().size()) {
@@ -392,6 +418,14 @@ public abstract class LogFile {
     }
   }
 
+  /**
+   * log文件随机只读Reader, 抽象类
+   * 当前版本支持v2和v3两个版本, 新的日志文件使用v3, 子类需要实现各自的
+   * {@link this#doGet(RandomAccessFile)}方法以实现底层协议相关的解析处理
+   *
+   * RandomReader的特点是可以读取任意offset的数据, 底层通过
+   * {@link RandomAccessFile#seek(long)}来定位数据
+   */
   static abstract class RandomReader {
     private final File file;
     private final BlockingQueue<RandomAccessFile> readFileHandles =
@@ -402,10 +436,14 @@ public abstract class LogFile {
         throws IOException {
       this.file = file;
       this.encryptionKeyProvider = encryptionKeyProvider;
+      // 预先创建一个文件读取实例
       readFileHandles.add(open());
       open = true;
     }
 
+    /**
+     * 留给不同版本的子类实现各自的get逻辑
+     */
     protected abstract TransactionEventRecord doGet(RandomAccessFile fileHandle)
         throws IOException, CorruptEventException;
 
@@ -419,21 +457,37 @@ public abstract class LogFile {
       return encryptionKeyProvider;
     }
 
+    /**
+     * 获取文件指定offset保存的Event
+     * @param offset
+     * @return
+     * @throws IOException
+     * @throws InterruptedException
+     * @throws CorruptEventException
+     * @throws NoopRecordException
+     */
     FlumeEvent get(int offset) throws IOException, InterruptedException,
       CorruptEventException, NoopRecordException {
       Preconditions.checkState(open, "File closed");
+      // 获取读取实例, 多线程同时读取可能会take阻塞等待
       RandomAccessFile fileHandle = checkOut();
       boolean error = true;
       try {
+        // 定位读起始位
         fileHandle.seek(offset);
         byte operation = fileHandle.readByte();
         if(operation == OP_NOOP) {
           throw new NoopRecordException("No op record found. Corrupt record " +
             "may have been repaired by File Channel Integrity tool");
         }
+        // record的开头标记符
         Preconditions.checkState(operation == OP_RECORD,
             Integer.toHexString(operation));
+        // 调用子类实现的方法解析文件流为Envet对象
         TransactionEventRecord record = doGet(fileHandle);
+        // 本类是只读的Reader, 所以只能获取Put操作, 别的操作不应该从这里获取?
+        /** 本方法只会被{@link org.apache.flume.channel.file.FileChannel#doTake()},
+         * 调用, 所以事实上也应该只获取到Put Event*/
         if(!(record instanceof Put)) {
           Preconditions.checkState(false, "Record is " +
               record.getClass().getSimpleName());
@@ -484,6 +538,13 @@ public abstract class LogFile {
       }
     }
 
+    /**
+     * 获取一个指向目标文件{@link this#file}的读取实例
+     * 同时存在实例数量上限由{@link this#readFileHandles}控制
+     * @return
+     * @throws IOException
+     * @throws InterruptedException
+     */
     private RandomAccessFile checkOut()
         throws IOException, InterruptedException {
       RandomAccessFile fileHandle = readFileHandles.poll();
@@ -509,6 +570,12 @@ public abstract class LogFile {
     }
   }
 
+  /**
+   * 顺序读取Reader
+   * 为保证顺序, 本类设计成一个实例只能只有一个fileHandle, 区别于RandomReader有多个
+   * 使用上创建一个RandomReader可能多次使用(在FileChannel#doTake()方法里使用), 而
+   * 本类应该创建一次使用一次
+   */
   public static abstract class SequentialReader {
 
     private final RandomAccessFile fileHandle;
@@ -622,6 +689,8 @@ public abstract class LogFile {
         if(offset >= fileHandle.length()) {
           return null;
         }
+        // 注意到, 这里的顺序Reader并不会像RandomReader抛弃非Put的Event, 因为顺序
+        // Reader主要是为了给replay操作用的
         return doNext(offset);
       } catch(EOFException e) {
         return null;
@@ -642,6 +711,7 @@ public abstract class LogFile {
       }
     }
   }
+
   protected static void writeDelimitedBuffer(ByteBuffer output, ByteBuffer buffer)
       throws IOException {
     output.putInt(buffer.limit());

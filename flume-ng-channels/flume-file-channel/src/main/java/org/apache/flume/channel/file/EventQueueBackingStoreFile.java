@@ -45,6 +45,13 @@ import com.google.common.collect.Maps;
 import com.google.common.collect.SetMultimap;
 
 
+/**
+ * event-checkpoint解析工具, checkpoint文件映射成内存中的LongBuffer
+ * {@link this#elementsBuffer}来操作读写
+ *
+ * 目前有两个不同版本的实现, V3比V2不同在于将元数据从checkpoint文件独立出来保存成一个meta
+ * 文件, 这有利于修改channel的格式. 具体可看 https://reviews.apache.org/r/6680/
+ */
 abstract class EventQueueBackingStoreFile extends EventQueueBackingStore {
   private static final Logger LOG = LoggerFactory
       .getLogger(EventQueueBackingStoreFile.class);
@@ -57,6 +64,7 @@ abstract class EventQueueBackingStoreFile extends EventQueueBackingStore {
   protected static final int CHECKPOINT_INCOMPLETE = 1;
 
   protected LongBuffer elementsBuffer;
+  // overwriteMap保存当前已经commit的Event, eventId->EventPtr
   protected final Map<Integer, Long> overwriteMap = new HashMap<Integer, Long>();
   protected final Map<Integer, AtomicInteger> logFileIDReferenceCounts = Maps.newHashMap();
   protected final MappedByteBuffer mappedBuffer;
@@ -73,6 +81,15 @@ abstract class EventQueueBackingStoreFile extends EventQueueBackingStore {
     this(capacity, name, checkpointFile, null, false);
   }
 
+  /**
+   * 从checkpoint文件恢复状态, 可能因为多种情况导致checkpoint恢复失败:
+   * 1. capacity修改后, checkpoint还保持原来capacity计算的大小, 抛出异常
+   * 2. checkpoint文件标记的版本跟当前版本不一致, 抛出异常
+   * 3. checkpoint的状态标记为incomplete, 抛出异常
+   * 以上三种情况抛出的异常均为BadCheckpointException, 这会在系统重启的时候被
+   * {@link Log#replay()}捕捉, 进一步选择替代checkpoint的方法启动系统
+   * @throws BadCheckpointException
+   */
   protected EventQueueBackingStoreFile(int capacity, String name,
       File checkpointFile, File checkpointBackupDir,
       boolean backupCheckpoint) throws IOException,
@@ -83,6 +100,9 @@ abstract class EventQueueBackingStoreFile extends EventQueueBackingStore {
     this.backupDir = checkpointBackupDir;
     checkpointFileHandle = new RandomAccessFile(checkpointFile, "rw");
     long totalBytes = (capacity + HEADER_SIZE) * Serialization.SIZE_OF_LONG;
+    // 当checkpointFile的长度为0, 即此尚未使用时, 根据capacity(channel.capacity)计
+    // 算文件所需空间并初始化, 往后就不再修改. 所以修改capacity时, 可能导致下一句if判断
+    // 抛出异常
     if(checkpointFileHandle.length() == 0) {
       allocate(checkpointFile, totalBytes);
       checkpointFileHandle.seek(INDEX_VERSION * Serialization.SIZE_OF_LONG);
@@ -108,6 +128,13 @@ abstract class EventQueueBackingStoreFile extends EventQueueBackingStore {
       throw new BadCheckpointException("Invalid version: " + version + " " +
               name + ", expected " + getVersion());
     }
+    /**
+     * 执行checkpoint的时候会将未commit的(inflight)Event序列化保存到checkpoint文件中,
+     * 开始执行checkpoint动作时会在marker位置写入{@link CHECKPOINT_INCOMPLETE}, 执行结束后会写入{@link CHECKPOINT_COMPLETE}
+     * 见{@link FlumeEventQueue#checkpoint(boolean)}
+     *
+     * 当发现marker标记不为complete时抛出BadCheckpointException异常
+     */
     long checkpointComplete = elementsBuffer.get(INDEX_CHECKPOINT_MARKER);
     if(checkpointComplete != (long) CHECKPOINT_COMPLETE) {
       throw new BadCheckpointException("Checkpoint was not completed correctly,"
@@ -228,6 +255,7 @@ abstract class EventQueueBackingStoreFile extends EventQueueBackingStore {
       }
     }
     // Start checkpoint
+    // 往checkpoint文件写入开始checkpoint的标记, 结束的时候还会写相应的结束标记
     elementsBuffer.put(INDEX_CHECKPOINT_MARKER, CHECKPOINT_INCOMPLETE);
     mappedBuffer.force();
   }

@@ -422,14 +422,24 @@ public class FileChannel extends BasicChannelSemantics {
   /**
    * Transaction backed by a file. This transaction supports either puts
    * or takes but not both.
+   * 基于文件实现的事务, 同一个事务内只能做读或者写当中的一个
    */
   static class FileBackedTransaction extends BasicTransactionSemantics {
+    // 事务take/put队列, 保存一个事务内未提交的临时event
     private final LinkedBlockingDeque<FlumeEventPointer> takeList;
     private final LinkedBlockingDeque<FlumeEventPointer> putList;
     private final long transactionID;
+    // channel空间不足时, 等待的时间
     private final int keepAlive;
+    /**
+     * log 和 queue的关系
+     *
+     */
+    // 事务持久化工具对象
     private final Log log;
+    // 持久化的event队列(包括已commit和未commit的)
     private final FlumeEventQueue queue;
+    // 内存中(未commit)的event队列信号量, 初始值配置为capacity
     private final Semaphore queueRemaining;
     private final String channelNameDescriptor;
     private final ChannelCounter channelCounter;
@@ -453,8 +463,14 @@ public class FileChannel extends BasicChannelSemantics {
       return String.valueOf(getState());
     }
 
+    /**
+     * 事务内put, 使用protobuf将event编码后落地到文件
+     * @param event
+     * @throws InterruptedException
+     */
     @Override
     protected void doPut(Event event) throws InterruptedException {
+      // put操作递增
       channelCounter.incrementEventPutAttemptCount();
       if(putList.remainingCapacity() == 0) {
         throw new ChannelException("Put queue for FileBackedTransaction " +
@@ -464,6 +480,7 @@ public class FileChannel extends BasicChannelSemantics {
       }
       // this does not need to be in the critical section as it does not
       // modify the structure of the log or queue.
+      // 等待channel腾出空间容纳新的event
       if(!queueRemaining.tryAcquire(keepAlive, TimeUnit.SECONDS)) {
         throw new ChannelException("The channel has reached it's capacity. "
             + "This might be the result of a sink on the channel having too "

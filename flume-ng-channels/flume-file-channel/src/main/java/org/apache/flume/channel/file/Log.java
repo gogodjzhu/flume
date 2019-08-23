@@ -70,6 +70,32 @@ import java.util.concurrent.locks.ReentrantReadWriteLock.WriteLock;
  * should only be called if tryLockShared returns true. After
  * the operation and any additional modifications of the
  * FlumeEventQueue, the Log.unlockShared method should be called.
+ *
+ * 本类代表FileChannel所依赖的日志持久化工具.
+ * 运行时整个channel内的Event信息都被维护在{@link this#queue}中. 但queue并不像
+ * MemoryChannel 那样保存Event的实际内容, 它保存的只是Event在持久化文件中的指针.
+ *
+ * 持久化文件分两个部分:
+ * - log文件{@link this#logDirs} 有n个目录构成, 所有的Event就持久化保存在这些文件当中,
+ *   包括Put/Take/Commit/Rollback 4中类型, 具体格式参看:
+ *    - {@link this#put(long, Event)}
+ *    - {@link this#take(long, FlumeEventPointer)}
+ *    - {@link this#commit(long, short)}
+ *    - {@link this#rollback(long)}
+ *   4种Event都包含所属的事务Id, 在保证Event完整且有序地写入log文件之后, 完全可以通过完
+ *   整地重跑所有Event来恢复任意适合的状态(本质上就是恢复{@link this#queue}这个队列).
+ *
+ * - checkpoint文件 每次重跑所有Event来恢复显然太慢. {@link this#checkpointDir}
+ *   保存了当前queue的快照信息(具体看{@link FlumeEventQueue#checkpoint(boolean)}),
+ *   这样就可以直接解析checkpoint文件恢复queue, 而不需要replay 所有log文件. (但是当
+ *   checkpoint文件损坏(比如未写完就关闭导致不完整), 或者升级导致版本不一致等灯光, 都会
+ *   变成full replay重跑所有log文件, 效率非常低)
+ *   在物理上我们会看到checkpoint包括3个部分:
+ *     - checkpoint 记录每次checkpoint操作时整个queue的元数据, 包括当前最新的日志写入
+ *       序号 和 已commit的消息列表, 以及checkpoint正常开始及结束标记.
+ *     - inflightputs文件 保存已提交未commit的putEvent
+ *     - inflighttakes文件 保存已提交未commit的takeEvent
+ *
  */
 @InterfaceAudience.Private
 @InterfaceStability.Unstable
@@ -95,6 +121,7 @@ public class Log {
   private long checkpointInterval;
   private long maxFileSize;
   private final boolean useFastReplay;
+  // 最少空闲空间
   private final long minimumRequiredSpace;
   private final Map<String, FileLock> locks;
   private final ReentrantReadWriteLock checkpointLock =
@@ -294,15 +321,20 @@ public class Log {
     }
     locks = Maps.newHashMap();
     try {
+      // 锁checkPoint目录
       lock(checkpointDir);
+      // 锁backupCheckpoint目录, 用于备份checkpointDir
       if(useDualCheckpoints) {
         lock(backupCheckpointDir);
       }
+      // 锁log文件
       for (File logDir : logDirs) {
         lock(logDir);
       }
     } catch(IOException e) {
       unlock(checkpointDir);
+      // TODO 这是bug么? 没有unlock(useDualCheckpoints), 当kill -9退出时岂不是无法
+      // 删除lock文件?
       for (File logDir : logDirs) {
         unlock(logDir);
       }
@@ -349,6 +381,7 @@ public class Log {
   /**
    * Read checkpoint and data files from disk replaying them to the state
    * directly before the shutdown or crash.
+   * 使用checkpoint恢复状态, 在启动的时候{@linkplain FileChannel#start()}调用此方法
    * @throws IOException
    */
   void replay() throws IOException {
@@ -365,6 +398,7 @@ public class Log {
        * create additional log files.
        *
        * Also store up the list of files so we can replay them later.
+       * 读取所有日志文件, 准备replay, 同时计算最大log文件id, 以供后续使用
        */
       LOGGER.info("Replay started");
       nextFileID.set(0);
@@ -374,6 +408,8 @@ public class Log {
           int id = LogUtils.getIDForFile(file);
           dataFiles.add(file);
           nextFileID.set(Math.max(nextFileID.get(), id));
+          // 初始化文件读取Reader, 当前支持两个版本的Reader对应两种格式的日志文件,
+          // 通过文件元数据可以判断版本
           idLogFileMap.put(id, LogFileFactory.getRandomReader(new File(logDir,
               PREFIX + id), encryptionKeyProvider));
         }
@@ -384,6 +420,7 @@ public class Log {
       /*
        * sort the data files by file id so we can replay them by file id
        * which should approximately give us sequential events
+       * log文件排序, 序号小的创建时间早, 排序靠前
        */
       LogUtils.sort(dataFiles);
 
@@ -403,16 +440,24 @@ public class Log {
               " does not exist: " + checkpointFile);
         }
       }
+      // 未commit状态的take操作 checkpoint文件
       File inflightTakesFile = new File(checkpointDir, "inflighttakes");
+      // 未commit状态的put操作 checkpoint文件
       File inflightPutsFile = new File(checkpointDir, "inflightputs");
+      // 已经事务提交的event队列
       EventQueueBackingStore backingStore = null;
 
 
       try {
+        // 根据checkpointFile恢复backingStore, 如果checkpoint文件损坏(比如在
+        // checkpoint过程中关闭程序导致checkpoint不完整, checkpoint文件与capacity
+        // 配置不符 等) 会抛出异常, 其中可以恢复的情况异常封装为BadCheckpointException,
+        // 会在后续的catch中使用full play的方法恢复
         backingStore =
             EventQueueBackingStoreFactory.get(checkpointFile,
                 backupCheckpointDir, queueCapacity, channelNameDescriptor,
                 true, this.useDualCheckpoints);
+        // FlumeEventQueue 是一个封装了完整功能的event队列, 负责对外支持事务操作
         queue = new FlumeEventQueue(backingStore, inflightTakesFile,
                 inflightPutsFile);
         LOGGER.info("Last Checkpoint " + new Date(checkpointFile.lastModified())
@@ -426,10 +471,15 @@ public class Log {
          * This will throw if and only if checkpoint file was fine,
          * but the inflights were not. If the checkpoint was bad, the backing
          * store factory would have thrown.
+         *
+         * 上面这段注释写清楚了, 到这里checkpoint恢复已经完成了.
          */
         doReplay(queue, dataFiles, encryptionKeyProvider, shouldFastReplay);
-      } catch (BadCheckpointException ex) {
+      }
+      //
+      catch (BadCheckpointException ex) {
         backupRestored = false;
+        // 使用backupCheckpoint文件恢复
         if (useDualCheckpoints) {
           LOGGER.warn("Checkpoint may not have completed successfully. "
               + "Restoring checkpoint and starting up.", ex);
@@ -438,6 +488,8 @@ public class Log {
               checkpointDir, backupCheckpointDir);
           }
         }
+        // 没有backupCheckpoint或者使用backupCheckpoint恢复也失败了, 那么就删除掉所
+        // 有的checkpoint文件, 使用full relay
         if (!backupRestored) {
           LOGGER.warn("Checkpoint may not have completed successfully. "
               + "Forcing full replay, this may take a while.", ex);
@@ -489,10 +541,13 @@ public class Log {
                         boolean useFastReplay) throws Exception {
     CheckpointRebuilder rebuilder = new CheckpointRebuilder(dataFiles,
             queue);
+    // fastReplay, 关闭或者fastReplay失败都会切回常规replay
     if (useFastReplay && rebuilder.rebuild()) {
       didFastReplay = true;
       LOGGER.info("Fast replay successful.");
-    } else {
+    }
+    // 常规replay
+    else {
       ReplayHandler replayHandler = new ReplayHandler(queue,
               encryptionKeyProvider);
       if (useLogReplayV1) {
@@ -589,6 +644,27 @@ public class Log {
    * Log a put of an event
    *
    * Synchronization not required as this method is atomic
+   *
+   * 写入一个put event到日志
+   *
+   * 报文格式为:
+   *
+   * |----------------Put-------------------|
+   * |  |---------FlumeEvent-------------|  |
+   * |  |                                |  |
+   * |  |   |--FlumeEventHeader * n--|   |  |
+   * |  |   |------------------------|   |  |
+   * |  |                                |  |
+   * |  |   |-----bytes(body)--------|   |  |
+   * |  |   |------------------------|   |  |
+   * |  |                                |  |
+   * |  |--------------------------------|  |
+   * |                                      |
+   * |  |-------sfixed64(checksum)-------|  |
+   * |  |                                |  |
+   * |  |--------------------------------|  |
+   * |--------------------------------------|
+   *
    * @param transactionID
    * @param event
    * @return
@@ -599,10 +675,17 @@ public class Log {
     Preconditions.checkState(open, "Log is closed");
     FlumeEvent flumeEvent = new FlumeEvent(
         event.getHeaders(), event.getBody());
+    // Put对象为一个Put操作的所有信息, 包含三个属性: 事务ID, 写日志文件ID, event实体
     Put put = new Put(transactionID, WriteOrderOracle.next(), flumeEvent);
+
+    // 将Put对象编译为protobuf格式的ByteBuffer
     ByteBuffer buffer = TransactionEventRecord.toByteBuffer(put);
+
+    // 事务号对文件数取余 得到 将要用于落地的日志文件编号
     int logFileIndex = nextLogWriter(transactionID);
+    // 日志文件剩余可用空间
     long usableSpace = logFiles.get(logFileIndex).getUsableSpace();
+    // 可用空间检查
     long requiredSpace = minimumRequiredSpace + buffer.limit();
     if(usableSpace <= requiredSpace) {
       throw new IOException("Usable space exhaused, only " + usableSpace +
@@ -611,10 +694,14 @@ public class Log {
     boolean error = true;
     try {
       try {
+        /** 底层通过{@linkplain LogFile.Writer#write(ByteBuffer)} 将byteBuffer写
+         * 入文件 */
         FlumeEventPointer ptr = logFiles.get(logFileIndex).put(buffer);
         error = false;
         return ptr;
-      } catch (LogFileRetryableIOException e) {
+      }
+      // 可重试异常, 则重试一次
+      catch (LogFileRetryableIOException e) {
         if(!open) {
           throw e;
         }
@@ -634,6 +721,20 @@ public class Log {
    * Log a take of an event, pointer points at the corresponding put
    *
    * Synchronization not required as this method is atomic
+   *
+   * 写入一个take event到日志, 操作类似于{@linkplain this#put(long, Event)}
+   *
+   * 报文格式为:
+   * |----------------Take------------------|
+   * |  |-------sfixed64(fileID)---------|  |
+   * |  |                                |  |
+   * |  |--------------------------------|  |
+   * |                                      |
+   * |  |-------sfixed64(offset)---------|  |
+   * |  |                                |  |
+   * |  |--------------------------------|  |
+   * |--------------------------------------|
+   *
    * @param transactionID
    * @param pointer
    * @throws IOException
@@ -675,6 +776,14 @@ public class Log {
    * Log a rollback of a transaction
    *
    * Synchronization not required as this method is atomic
+   *
+   * 写入一个rollback操作到日志文件, 操作类似于{@linkplain this#put(long, Event)}
+   *
+   * 报文格式为(为空):
+   * |----------------RollBack--------------|
+   * |                                      |
+   * |--------------------------------------|
+   *
    * @param transactionID
    * @throws IOException
    */
@@ -720,6 +829,9 @@ public class Log {
    * could infer but it's best to be explicit.
    *
    * Synchronization not required as this method is atomic
+   *
+   * 写入一个commit put操作到日志文件, 因为一个事务只能包含put 或者 take操作 二选一,
+   * 将两者分开, 在事务回滚的时候更容易将对应的event从queue移除或者恢复
    * @param transactionID
    * @throws IOException
    * @throws InterruptedException
@@ -737,6 +849,8 @@ public class Log {
    * could infer but it's best to be explicit.
    *
    * Synchronization not required as this method is atomic
+   * 写入一个commit take操作到日志文件, 因为一个事务只能包含put 或者 take操作 二选一,
+   * 将两者分开, 在事务回滚的时候更容易将对应的event从queue移除或者恢复
    * @param transactionID
    * @throws IOException
    * @throws InterruptedException
@@ -851,6 +965,14 @@ public class Log {
   /**
    * Synchronization not required as this method is atomic
    *
+   * 写入一个commit操作到日志文件, 操作类似于{@linkplain this#put(long, Event)}
+   *
+   * 报文格式为:
+   * |----------------Commit----------------|
+   * |  |-------sfixed64(type)-----------|  |
+   * |  |                                |  |
+   * |  |--------------------------------|  |
+   * |--------------------------------------|
    * @param transactionID
    * @param type
    * @throws IOException
@@ -874,6 +996,7 @@ public class Log {
         // this ensures that the number of actual fsyncs is small and a
         // number of them are grouped together into one.
         logFileWriter.commit(buffer);
+        // 持久化到磁盘(FileChannel -> Disk)
         logFileWriter.sync();
         error = false;
       } catch (LogFileRetryableIOException e) {
@@ -975,7 +1098,12 @@ public class Log {
    * Synchronization is not required because this method acquires a
    * write lock. So this method gets exclusive access to all the
    * data structures this method accesses.
-   * @param force  a flag to force the writing of checkpoint
+   *
+   * 将当前queue状态写入快照相关文件.
+   *
+   * @param force  a flag to force the writing of checkpoint 是否非写不可, 在启动
+   *               replay之后就会调用一次非写不可的checkpoint写入, 其他情况下是通过一
+   *               个独立的线程来定时非强制写入checkpoint
    * @throws IOException if we are unable to write the checkpoint out to disk
    */
   private Boolean writeCheckpoint(Boolean force) throws Exception {
@@ -985,13 +1113,16 @@ public class Log {
       throw new IOException("Usable space exhaused, only " + usableSpace +
           " bytes remaining, required " + minimumRequiredSpace + " bytes");
     }
+    // 独占锁, 保证线程安全
     boolean lockAcquired = tryLockExclusive();
     if(!lockAcquired) {
       return false;
     }
     SortedSet<Integer> logFileRefCountsAll = null, logFileRefCountsActive = null;
     try {
+      // 先写入checkpoint文件
       if (queue.checkpoint(force)) {
+        // 接下来遍历所有活跃的log文件, 更新他们的信息写入到对应meta文件
         long logWriteOrderID = queue.getLogWriteOrderID();
 
         //Since the active files might also be in the queue's fileIDs,
@@ -1053,6 +1184,7 @@ public class Log {
     }
     //Do the deletes outside the checkpointWriterLock
     //Delete logic is expensive.
+    // 在checkpoint完成之后处理过期log文件的清理工作
     if (open && checkpointCompleted) {
       removeOldLogs(logFileRefCountsActive);
     }
@@ -1061,6 +1193,11 @@ public class Log {
     return true;
   }
 
+  /**
+   * 移除无用的旧log文件, 为了兼容backup checkpoint的模式, 清除工作选择了先标记, 下次
+   * 清除的模式
+   * @param fileIDs 所有仍在使用的日志文件id
+   */
   private void removeOldLogs(SortedSet<Integer> fileIDs) {
     Preconditions.checkState(open, "Log is closed");
     // To maintain a single code path for deletes, if backup of checkpoint is
@@ -1071,6 +1208,7 @@ public class Log {
     // and thus these files are no longer needed).
     for(File fileToDelete : pendingDeletes) {
       LOGGER.info("Removing old file: " + fileToDelete);
+      // deleteQuietly方法会删除指定文件or目录, 成功或者失败均不会抛出异常, 静默删除
       FileUtils.deleteQuietly(fileToDelete);
     }
     pendingDeletes.clear();
@@ -1108,6 +1246,10 @@ public class Log {
    * <p> If locking is supported we guarantee exculsive access to the
    * storage directory. Otherwise, no guarantee is given.
    *
+   * 使用文件锁锁住一个目录
+   * 注意到这里 部分文件系统不支持排它锁, 所以做了一次secondLock排他性检测, 不支持的时
+   * 候打出warn日志, 但是实际上还是当获取锁来处理, 这里比较危险
+   *
    * @throws IOException if locking fails
    */
   private void lock(File dir) throws IOException {
@@ -1119,6 +1261,7 @@ public class Log {
       LOGGER.info(msg);
       throw new IOException(msg);
     }
+    // 二次检测排他性
     FileLock secondLock = tryLock(dir);
     if(secondLock != null) {
       LOGGER.warn("Directory "+dir+" does not support locking");
@@ -1142,6 +1285,7 @@ public class Log {
     RandomAccessFile file = new RandomAccessFile(lockF, "rws");
     FileLock res = null;
     try {
+      // nio 提供的一个非常重要的基于文件的分布式锁
       res = file.getChannel().tryLock();
     } catch(OverlappingFileLockException oe) {
       file.close();

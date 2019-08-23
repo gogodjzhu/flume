@@ -44,6 +44,11 @@ class Rollback extends TransactionEventRecord {
   public void write(DataOutput out) throws IOException {
     super.write(out);
   }
+
+  /**
+   * 将本实例编译为protobuf字节流写入到输出流, 报文格式见:
+   * {@linkplain Log#rollback(long)}
+   */
   @Override
   void writeProtos(OutputStream out) throws IOException {
     ProtosFactory.Rollback.Builder rollbackBuilder =

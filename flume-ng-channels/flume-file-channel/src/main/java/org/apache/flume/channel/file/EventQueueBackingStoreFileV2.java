@@ -26,6 +26,16 @@ import java.util.concurrent.atomic.AtomicInteger;
 
 import com.google.common.base.Preconditions;
 
+/**
+ * V2版本的event-checkpoint解析工具, 此版本在checkpoint文件的头部保存整个checkpoint的
+ * 元数据, 格式为:
+ * | 属性                     | index |
+ * | writeOrder               |   0   | 占2个字节, long型, 保存event序号
+ * | indexSize                |   2   | 占1个字节, int型, 保存当前checkpoint queue中的event数量
+ * | indexHead                |   3   | 占1个字节, int型, 保存当前checkpoint queue中的head
+ * | logFileIDReferenceCounts | (INDEX_ACTIVE_LOG ... INDEX_ACTIVE_LOG + MAX_ACTIVE_LOGS) | 每个logFile占2字节, 高位字节int保存fileID,
+ *                                                                                          低位字节int保存当前checkpoint文件共有的Event数量
+ */
 final class EventQueueBackingStoreFileV2 extends EventQueueBackingStoreFile {
 
 

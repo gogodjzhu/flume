@@ -28,6 +28,7 @@ import java.util.zip.CRC32;
 import java.util.zip.Checksum;
 
 import com.google.common.annotations.VisibleForTesting;
+import org.apache.flume.Event;
 import org.apache.flume.channel.file.proto.ProtosFactory;
 
 import com.google.common.base.Preconditions;
@@ -70,6 +71,11 @@ class Put extends TransactionEventRecord {
     super.write(out);
     event.write(out);
   }
+
+  /**
+   * 将本实例编译为protobuf字节流写入到输出流, 报文格式见:
+   * {@linkplain Log#put(long, Event)}
+   */
   @Override
   void writeProtos(OutputStream out) throws IOException {
     ProtosFactory.Put.Builder putBuilder = ProtosFactory.Put.newBuilder();

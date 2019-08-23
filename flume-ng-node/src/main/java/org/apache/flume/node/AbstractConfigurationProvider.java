@@ -98,6 +98,7 @@ public abstract class AbstractConfigurationProvider implements
       Map<String, SourceRunner> sourceRunnerMap = Maps.newHashMap();
       Map<String, SinkRunner> sinkRunnerMap = Maps.newHashMap();
       try {
+        /*实例化Channel->实例化Source->实例化Sink*/
         loadChannels(agentConf, channelComponentMap);
         loadSources(agentConf, channelComponentMap, sourceRunnerMap);
         loadSinks(agentConf, channelComponentMap, sinkRunnerMap);
@@ -258,6 +259,13 @@ public abstract class AbstractConfigurationProvider implements
     return channel;
   }
 
+    /**
+     * 根据配置初始化source组件
+     * @param agentConf
+     * @param channelComponentMap
+     * @param sourceRunnerMap
+     * @throws InstantiationException
+     */
   private void loadSources(AgentConfiguration agentConf,
       Map<String, ChannelComponent> channelComponentMap,
       Map<String, SourceRunner> sourceRunnerMap)
@@ -274,10 +282,14 @@ public abstract class AbstractConfigurationProvider implements
       if(comp != null) {
         SourceConfiguration config = (SourceConfiguration) comp;
 
+        // Factory根据type通过反射获取对应的类, 并实例化对象
         Source source = sourceFactory.create(comp.getComponentName(),
             comp.getType());
         try {
+          // 调用source的configure方法初始化配置参数
           Configurables.configure(source, config);
+
+          // 获取source.channels配置, 将对应channel保存到list, 等待关联回source
           Set<String> channelNames = config.getChannels();
           List<Channel> sourceChannels = new ArrayList<Channel>();
           for (String chName : channelNames) {
@@ -286,21 +298,29 @@ public abstract class AbstractConfigurationProvider implements
               sourceChannels.add(channelComponent.channel);
             }
           }
+          // 每个source必须关联最少一个channel, 否则数据没有去向
           if(sourceChannels.isEmpty()) {
             String msg = String.format("Source %s is not connected to a " +
                 "channel",  sourceName);
             throw new IllegalStateException(msg);
           }
+
+          // 获取source.channelSelector配置(可能为空)
           ChannelSelectorConfiguration selectorConfig =
               config.getSelectorConfiguration();
-
+          // ChannelSelectorFactory生成ChannelSelector, selectorConfig为空时默认
+          // 为ReplicatingChannelSelector
           ChannelSelector selector = ChannelSelectorFactory.create(
               sourceChannels, selectorConfig);
 
+          // 使用channelSelector实例生成ChannelProcessor, source直接调用processor
+          // 来做channel选择
           ChannelProcessor channelProcessor = new ChannelProcessor(selector);
+          // 初始化channelProcessor的配置, 主要是interceptors的配置
           Configurables.configure(channelProcessor, config);
-
+          // 将processor关联到source
           source.setChannelProcessor(channelProcessor);
+          // 将source向上转型为Runner, 方便工具类管理启动
           sourceRunnerMap.put(comp.getComponentName(),
               SourceRunner.forSource(source));
           for(Channel channel : sourceChannels) {

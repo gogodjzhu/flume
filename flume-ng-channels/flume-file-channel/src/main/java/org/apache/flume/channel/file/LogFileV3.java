@@ -44,6 +44,8 @@ import java.util.concurrent.LinkedBlockingDeque;
 /**
  * Represents a single data file on disk. Has methods to write,
  * read sequentially (replay), and read randomly (channel takes).
+ * 代表硬盘中的一个log文件, 同时在当前V3版本中每个log文件还有一个对应的.meta结尾的元数据
+ * 文件保存当前log文件最新checkpoint的信息
  */
 @InterfaceAudience.Private
 @InterfaceStability.Unstable
@@ -76,6 +78,12 @@ public class LogFileV3 extends LogFile {
       return Serialization.VERSION_3;
     }
 
+    /**
+     * checkpoint信息写入meta文件
+     * @param currentPosition
+     * @param logWriteOrderID
+     * @throws IOException
+     */
     @Override
     void markCheckpoint(long currentPosition, long logWriteOrderID)
         throws IOException {
@@ -131,6 +139,8 @@ public class LogFileV3 extends LogFile {
   /**
    * Writes a GeneratedMessage to a temp file, synchronizes it to disk
    * and then renames the file over file.
+   * 将消息写入指定文件, 采用tmp->rename模式覆盖已有同名文件
+   *
    * @param msg GeneratedMessage to write to the file
    * @param file destination file
    * @throws IOException if a write error occurs or the File.renameTo
@@ -307,6 +317,8 @@ public class LogFileV3 extends LogFile {
     public SequentialReader(File file, @Nullable KeyProvider
       encryptionKeyProvider) throws EOFException, IOException {
       super(file, encryptionKeyProvider);
+      // 获取元数据文件, 执行到这里, 元数据文件肯定存在, 要么有旧的文件, 要么在前面的代
+      // 码中创建
       File metaDataFile = Serialization.getMetaDataFile(file);
       FileInputStream inputStream = new FileInputStream(metaDataFile);
       try {
@@ -330,6 +342,8 @@ public class LogFileV3 extends LogFile {
               getDecrypter(encryption.getCipherProvider(), key,
                   encryption.getParameters().toByteArray());
         }
+        // 利用元数据文件来初始化logFile的读取状态, 如果已有旧的元数据文件, 则这里可以
+        // 将position提前, 避免full replay
         setLogFileID(metaData.getLogFileID());
         setLastCheckpointPosition(metaData.getCheckpointPosition());
         setLastCheckpointWriteOrderID(metaData.getCheckpointWriteOrderID());

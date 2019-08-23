@@ -60,22 +60,32 @@ public class CheckpointRebuilder {
     this.queue = queue;
   }
 
+  /**
+   * fastReplay实际执行, 将log文件还原为queue队列
+   * @return
+   * @throws IOException
+   * @throws Exception
+   */
   public boolean rebuild() throws IOException, Exception {
     LOG.info("Attempting to fast replay the log files.");
     List<LogFile.SequentialReader> logReaders = Lists.newArrayList();
     for (File logFile : logFiles) {
       try {
+        // 依赖文件实例化顺序Reader
         logReaders.add(LogFileFactory.getSequentialReader(logFile, null));
       } catch(EOFException e) {
         LOG.warn("Ignoring " + logFile + " due to EOF", e);
       }
     }
+    // 全局的最新事务号和写入序号, 全局递增
     long transactionIDSeed = 0;
     long writeOrderIDSeed = 0;
     try {
       for (LogFile.SequentialReader log : logReaders) {
         LogRecord entry;
         int fileID = log.getLogFileID();
+        // 顺序解析文件, 得到LogRecord, 再根据不同的Event类型在内存中重做整个过程. 最
+        // 终得到已commit, 未take保留在channel中的put Event 的指针放回queue内存队列
         while ((entry = log.next()) != null) {
           int offset = entry.getOffset();
           TransactionEventRecord record = entry.getEvent();
@@ -104,6 +114,8 @@ public class CheckpointRebuilder {
                       uncommittedPuts.get(record.getTransactionID());
               if (puts != null) {
                 for (ComparableFlumeEventPointer put : puts) {
+                  // pending队列是已commit take的Event, 即还未落地commit文件就已经
+                  // 被commit take消费
                   if (!pendingTakes.remove(put)) {
                     committedPuts.add(put);
                   }
@@ -114,6 +126,9 @@ public class CheckpointRebuilder {
                       uncommittedTakes.get(record.getTransactionID());
               if (takes != null) {
                 for (ComparableFlumeEventPointer take : takes) {
+                  // commit Take Event, 将对应的Event从commitPuts中移除(此Event即被完整消费)
+                  // 如果在commitPuts中没找到对应的event, 将其放入pendingTakes.
+                  // TODO 可以take未commit的event? 难道put/take Event写入文件不一定严格有序
                   if (!committedPuts.remove(take)) {
                     pendingTakes.add(take);
                   }
@@ -141,10 +156,14 @@ public class CheckpointRebuilder {
         reader.close();
       }
     }
+    // 最后根据日志序号对全部剩余的commitPut做排序, 放回到queue, replay结束
     Set<ComparableFlumeEventPointer> sortedPuts =
             Sets.newTreeSet(committedPuts);
     int count = 0;
     for (ComparableFlumeEventPointer put : sortedPuts) {
+      /** 注意queue保存的是 {@link FlumeEventPointer}, 它的属性只包含日志文件和event
+       * 对应的offset 而不是整个event实体
+       * */
       queue.addTail(put.pointer);
       count++;
     }

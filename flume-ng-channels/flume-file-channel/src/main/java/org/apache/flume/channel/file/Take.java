@@ -63,6 +63,11 @@ class Take extends TransactionEventRecord {
     out.writeInt(offset);
     out.writeInt(fileID);
   }
+
+  /**
+   * 将本实例编译为protobuf字节流写入到输出流, 报文格式见:
+   * {@linkplain Log#take(long, FlumeEventPointer)}
+   */
   @Override
   void writeProtos(OutputStream out) throws IOException {
     ProtosFactory.Take.Builder takeBuilder = ProtosFactory.Take.newBuilder();

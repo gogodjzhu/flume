@@ -47,6 +47,9 @@ import com.google.common.collect.SetMultimap;
  * header and circular queue semantics. The header of the queue
  * contains the timestamp of last sync, the queue size and
  * the head position.
+ *
+ * Channel内event缓存队列, 包括已commit的的Event保存在{@link this#backingStore},
+ * 未commit的Event分别保存在{@link this#inflightTakes} 和 {@link this#inflightPuts}
  */
 final class FlumeEventQueue {
   private static final Logger LOG = LoggerFactory
@@ -233,6 +236,12 @@ final class FlumeEventQueue {
     backingStore.put(index, value);
   }
 
+  /**
+   * 在指定index位置添加value, 会导致整体位移
+   * @param index
+   * @param value
+   * @return
+   */
   protected boolean add(int index, long value) {
     if (index < 0 || index > backingStore.getSize()) {
       throw new IndexOutOfBoundsException(String.valueOf(index)
@@ -332,8 +341,16 @@ final class FlumeEventQueue {
    * A representation of in flight events which have not yet been committed.
    * None of the methods are thread safe, and should be called from thread
    * safe methods only.
+   *
+   * 封装了所有尚未commit的event, 主要属性包括:
+   * - inflightEvents 保存Event的指针, 以事务id为key
+   * - inflightFileIDs 保存Event持久化所在的文件id, 以事务id为key
+   * - file, fileChannel 当前对象持久化的文件
+   *
+   * 存储event的格式可以参考 {@link InflightEventWrapper#serializeAndWrite()}
    */
   class InflightEventWrapper {
+    // SetMultimap 类似于一个 Map<Key, Set<Value>>
     private SetMultimap<Long, Long> inflightEvents = HashMultimap.create();
     // Both these are volatile for safe publication, they are never accessed by
     // more than 1 thread at a time.
@@ -373,6 +390,7 @@ final class FlumeEventQueue {
 
     /**
      * Add an event pointer to the inflights list.
+     * 添加某事务未commitEvent到inflight map
      * @param transactionID
      * @param pointer
      */
@@ -387,6 +405,9 @@ final class FlumeEventQueue {
      * Serialize the set of in flights into a byte longBuffer.
      * @return Returns the checksum of the buffer that is being
      * asynchronously written to disk.
+     * 将event刷入文件, 格式为:
+     * | checkSum | 事务号txnID | event数量 | event1, event2 ...  event n |
+     * 其中checkSum是对整个事务计算的
      */
     public void serializeAndWrite() throws Exception {
       Collection<Long> values = inflightEvents.values();
@@ -407,12 +428,14 @@ final class FlumeEventQueue {
                 + values.size()) * 8) //Event pointers
                 + 16; //Checksum
         //There is no real need of filling the channel with 0s, since we
-        //will write the exact nummber of bytes as expected file size.
+        //will write the exact number of bytes as expected file size.
         file.setLength(expectedFileSize);
         Preconditions.checkState(file.length() == expectedFileSize,
                 "Expected File size of inflight events file does not match the "
                 + "current file size. Checkpoint is incomplete.");
         file.seek(0);
+        // buffer 开辟一段内存空间, 存储所有inflight的event, 格式为:
+        // | 事务号txnID | event数量 | event1, event2 ...  event n |
         final ByteBuffer buffer = ByteBuffer.allocate(expectedFileSize);
         LongBuffer longBuffer = buffer.asLongBuffer();
         for (Long txnID : inflightEvents.keySet()) {
@@ -427,9 +450,12 @@ final class FlumeEventQueue {
           longBuffer.put(written);
         }
         byte[] checksum = digest.digest(buffer.array());
+        // checksum写入 文件
         file.write(checksum);
         buffer.position(0);
+        // 将buffer结果写入 文件
         fileChannel.write(buffer);
+        // 强制刷入硬盘
         fileChannel.force(true);
         syncRequired = false;
       } catch (IOException ex) {

@@ -41,6 +41,24 @@ import com.google.common.collect.ImmutableMap;
 
 /**
  * Base class for records in data file: Put, Take, Rollback, Commit
+ *
+ * 报文格式为:
+ *
+ * |-------------Record-------------------|
+ * |  |---------FlumeEvent-------------|  |
+ * |  |                                |  |
+ * |  |   |--FlumeEventHeader * n--|   |  |
+ * |  |   |------------------------|   |  |
+ * |  |                                |  |
+ * |  |   |-----bytes(body)--------|   |  |
+ * |  |   |------------------------|   |  |
+ * |  |                                |  |
+ * |  |--------------------------------|  |
+ * |                                      |
+ * |  |-------sfixed64(checksum)-------|  |
+ * |  |                                |  |
+ * |  |--------------------------------|  |
+ * |--------------------------------------|
  */
 @InterfaceAudience.Private
 @InterfaceStability.Unstable
@@ -161,16 +179,30 @@ public abstract class TransactionEventRecord implements Writable {
     return entry;
   }
 
+  /**
+   * 将一个事务记录转为 protobuf字节流 ByteBuffer
+   * ByteBuffer分为三部分:
+   * |-----------------------|-----------------------|-----------------------|
+   * |TransactionEventHeader |TransactionEventRecord |TransactionEventFooter |
+   *
+   * 能够将三个Message的protobuf字节流写入同一个ByteBuffer是使用了 writeDelimitedTo方法
+   */
   static ByteBuffer toByteBuffer(TransactionEventRecord record) {
     ByteArrayOutputStream byteOutput = new ByteArrayOutputStream(512);
     try {
+      // Header
       ProtosFactory.TransactionEventHeader.Builder headerBuilder =
           ProtosFactory.TransactionEventHeader.newBuilder();
       headerBuilder.setType(record.getRecordType());
       headerBuilder.setTransactionID(record.getTransactionID());
       headerBuilder.setWriteOrderID(record.getLogWriteOrderID());
       headerBuilder.build().writeDelimitedTo(byteOutput);
+
+      // Record
+      // 注意Record编译为protobuf的操作放在具体的Record子类中实现
       record.writeProtos(byteOutput);
+
+      // Footer
       ProtosFactory.TransactionEventFooter footer =
           ProtosFactory.TransactionEventFooter.newBuilder().build();
       footer.writeDelimitedTo(byteOutput);
@@ -189,6 +221,9 @@ public abstract class TransactionEventRecord implements Writable {
   }
 
 
+  /**
+   * 通过protobuf字节解析事务对象
+   */
   static TransactionEventRecord fromByteArray(byte[] buffer)
       throws IOException, CorruptEventException {
     ByteArrayInputStream in = new ByteArrayInputStream(buffer);
@@ -199,9 +234,12 @@ public abstract class TransactionEventRecord implements Writable {
       short type = (short)header.getType();
       long transactionID = header.getTransactionID();
       long writeOrderID = header.getWriteOrderID();
+      // 根据type反射实例化一个事务对象(缺少实体, 仅有ID)
       TransactionEventRecord transactionEvent =
           newRecordForType(type, transactionID, writeOrderID);
+      // 使用事务对象实现的解析方法来解析字节流, 填充实体
       transactionEvent.readProtos(in);
+      // Footer未使用
       @SuppressWarnings("unused")
       ProtosFactory.TransactionEventFooter footer = Preconditions.checkNotNull(
           ProtosFactory.TransactionEventFooter.

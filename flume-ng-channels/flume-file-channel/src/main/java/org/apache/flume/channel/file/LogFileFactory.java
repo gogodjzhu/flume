@@ -114,6 +114,10 @@ class LogFileFactory {
       File oldMetadataFile = Serialization.getOldMetaDataFile(file);
       File tempMetadataFile = Serialization.getMetaDataTempFile(file);
       boolean hasMeta = false;
+      // 由于不同版本的操作系统对rename文件操作的实现不一致, 可能导致问题, 下面提到的
+      // flume-1699 针对此做了fix, 具体可以看https://reviews.apache.org/r/8087/
+      // 对此的讨论
+
       // FLUME-1699:
       // If the platform does not support atomic rename, then we
       // renamed log.meta -> log.meta.old followed by log.meta.tmp -> log.meta
@@ -159,6 +163,8 @@ class LogFileFactory {
           throw new EOFException(String.format("MetaData file %s is empty",
               metaDataFile));
         }
+        // 看得出来LogFileV3 跟 LogFileV2巨大的差别在于LogFileV3支持加密, 且V3有对应
+        // 的元数据文件保存元数据, 而V2直接将元数据保存在同一个文件中
         return new LogFileV3.SequentialReader(file, encryptionKeyProvider);
       }
       logFile = new RandomAccessFile(file, "r");

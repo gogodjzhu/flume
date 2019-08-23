@@ -48,6 +48,11 @@ class Commit extends TransactionEventRecord {
     super.readFields(in);
     type = in.readShort();
   }
+
+  /**
+   * 将本实例编译为protobuf字节流写入到输出流, 报文格式见:
+   * {@linkplain Log#commit(long, short)}
+   */
   @Override
   void writeProtos(OutputStream out) throws IOException {
     ProtosFactory.Commit.Builder commitBuilder =

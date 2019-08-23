@@ -33,6 +33,10 @@ import org.slf4j.LoggerFactory;
 import com.google.common.base.Preconditions;
 import com.google.protobuf.InvalidProtocolBufferException;
 
+/**
+ * V3版本的event-checkpoint解析工具, 使用单独的meta文件保存checkpoint的元数据
+ * 元数据文件以protobuf格式保存, 对应的定义在filechannel.proto文件中
+ */
 final class EventQueueBackingStoreFileV3 extends EventQueueBackingStoreFile {
   private static final Logger LOG = LoggerFactory
       .getLogger(EventQueueBackingStoreFileV3.class);
@@ -49,8 +53,10 @@ final class EventQueueBackingStoreFileV3 extends EventQueueBackingStoreFile {
     super(capacity, name, checkpointFile, checkpointBackupDir, backupCheckpoint);
     Preconditions.checkArgument(capacity > 0,
         "capacity must be greater than 0 " + capacity);
+    // checkpoint文件名 + .meta = 元数据文件名
     metaDataFile = Serialization.getMetaDataFile(checkpointFile);
     LOG.info("Starting up with " + checkpointFile + " and " + metaDataFile);
+    //
     if(metaDataFile.exists()) {
       FileInputStream inputStream = new FileInputStream(metaDataFile);
       try {
@@ -74,6 +80,7 @@ final class EventQueueBackingStoreFileV3 extends EventQueueBackingStoreFile {
           LOG.warn(msg);
           throw new BadCheckpointException(msg);
         }
+        // 将 checkpoint元数据恢复
         WriteOrderOracle.setSeed(logWriteOrderID);
         setLogWriteOrderID(logWriteOrderID);
         setSize(checkpoint.getQueueSize());
@@ -103,11 +110,13 @@ final class EventQueueBackingStoreFileV3 extends EventQueueBackingStoreFile {
       ProtosFactory.Checkpoint.Builder checkpointBuilder =
           ProtosFactory.Checkpoint.newBuilder();
       checkpointBuilder.setVersion(getVersion());
+      // 如果没有checkpoint文件, 一下几个值均为初始0
       checkpointBuilder.setQueueHead(getHead());
       checkpointBuilder.setQueueSize(getSize());
       checkpointBuilder.setWriteOrderID(getLogWriteOrderID());
       FileOutputStream outputStream = new FileOutputStream(metaDataFile);
       try {
+        // protobuf字节流写入新文件
         checkpointBuilder.build().writeDelimitedTo(outputStream);
         outputStream.getChannel().force(true);
       } finally {
