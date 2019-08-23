@@ -645,6 +645,10 @@ public class Log {
    *
    * Synchronization not required as this method is atomic
    *
+   * 本方法是不需要加锁的, 因为最终负责写入的方法{@link LogFile.Writer#put(ByteBuffer)}
+   * 是加锁的可以保证线程安全. 从这里可以看出, 增加logFiles的数量(在配置中就是增加dataDirs)
+   * 的数量, 可以减少锁的竞争, 增加并发.
+   *
    * 写入一个put event到日志
    *
    * 报文格式为:
